@@ -15,6 +15,7 @@
 #include "frame/hiding_conditions.h"
 #include "iop/member.h"
 #include "engine/card_plan.h"
+#include "common/setting.h" // one-off (not upstream): g_parallel_streams
 #include "prover/chain_host.cuh"
 
 // Fills the plan of a segment's first commit point: the sub-proof's own matrices of packed cells,
@@ -170,6 +171,12 @@ inline int Prover::chain_make() {
   unsigned most_rounds = 0, most_draws = 0; // upper bounds between `lend` and `take_back`: the first chain's totals
   for (const blk::PlanRound &r : frame->proof().chains.at(0).plan->rounds_) most_rounds += (unsigned)r.count, most_draws += (unsigned)(r.count * r.draw_E);
   for (int j = 0; j < in_step; j++) chain.in_step.emplace_back(new ChainRun(chain.fixed, most_rounds, most_draws));
+  // One-off (not upstream): see ChainHost::streams (chain_host.cuh). Created once, kept for the
+  // program's life (cp_prove's requests of a batch pass are short-lived but the slots are not).
+  if (g_parallel_streams) {
+    chain.streams.resize(in_step);
+    for (cudaStream_t &s : chain.streams) CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+  }
   chain.begun_under.assign(in_step, ChainHost::NOT_BEGUN);
   chain.enter(0);
   // Index-mask message (masks for claims on the weight table): mask rows only, uniform and fresh.
@@ -234,7 +241,7 @@ inline void Prover::chain_begin_request() {
   chain_coins().bytes(bytes, sizeof bytes);
   blk::Digest random_bytes;
   blk::digest_from_bytes(bytes, random_bytes);
-  chain.request->begin(std::move(binder), bound, random_bytes, chain_coins(), chain_engine(), cudaStreamPerThread);
+  chain.request->begin(std::move(binder), bound, random_bytes, chain_coins(), chain_engine(), chain.stream_of(chain.member));
   tr = chain.request->tr();
 }
 inline blk::EngineGpu &Prover::chain_engine() { return *opening_of_the_batch->engine; }
@@ -277,11 +284,11 @@ inline void Prover::chain_bind(int link) {
     if (!chain.request->index_mask_entry_holds(cell)) g_slot_entered->pads_differ = true;
   };
   ch::host.later = [this, link](int m, const std::vector<const void *> &at, Tr *t) {
-    StageClock::Within frame(stage_clock, StageClock::Frame);
+    StageClock::Within frame(stage_clock, StageClock::FrameLater);
     chain.later(link, m, at, t);
   };
   ch::host.first = [this, link](Tr *t, const u32 *y) {
-    StageClock::Within frame(stage_clock, StageClock::Frame);
+    StageClock::Within frame(stage_clock, StageClock::FrameFirst);
     chain.first(link, t, y);
   };
 }

@@ -26,6 +26,17 @@ struct Arguments {
   int batch = 1;   // largest size of a batch, whose requests share one opening; with -in: its size
   int in_step = 1; // how many of them share a pass over the weights, by layer group (2^`ll` layers)
   bool measure = false;        // print lines that begin with "measure:", with each batch's times
+  // One-off (not upstream): batches the several small device->host syncs that close_by_frame()
+  // (prover/hiding/door_chain.cuh) makes per sub-proof into one, instead of one sync per fetch.
+  bool batch_fetch = false;
+  // One-off (not upstream): threads CardFold::bind()'s host-side fold loop (prover/engine/fold.cuh).
+  bool parallel_fold = false;
+  // One-off (not upstream): gives each in_step slot (chain_host.cuh) its own CUDA stream instead
+  // of sharing cudaStreamPerThread, letting a batch's cryptographically-independent requests'
+  // kernels run concurrently instead of fully serialized through one stream.
+  bool parallel_streams = false;
+  // One-off (not upstream): double-buffers CardTiled's planes_ work space (engine/tiled.cuh).
+  bool double_buffer_planes = false;
   bool end_when_empty = false; // end, as with the stop file, when a batch is due and no request is waiting
   bool keep_for_the_audit = false; // with -in: keep the batch's 32 system bytes in isk/audit/
   long long most_batches = 0;  // end, as with the stop file, after this many batches; 0: no limit
@@ -262,6 +273,10 @@ struct Arguments {
     for (int i = 1; i < argc; i++) {
       const std::string a = argv[i];
       bool *const flag = a == "-measure"          ? &measure
+                         : a == "-batch-fetch"    ? &batch_fetch
+                         : a == "-parallel-fold"  ? &parallel_fold
+                         : a == "-parallel-streams" ? &parallel_streams
+                         : a == "-double-buffer-planes" ? &double_buffer_planes
                          : a == "-end-when-empty" ? &end_when_empty
                          : a == "-keep-for-the-audit" ? &keep_for_the_audit
                          : a == "-overlap"        ? &overlap

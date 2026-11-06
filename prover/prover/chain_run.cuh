@@ -31,6 +31,7 @@
 
 #include "common/end_name.h"
 #include "common/setting.h"  // TESTENV
+#include "prover/stage_clock.h"  // one-off (not upstream): stage_clock, for a diagnostic mark in close()
 #include "engine/engine_gpu.cuh"
 #include "engine/lay.cuh"
 #include "hiding/lost_copies_door.cuh"
@@ -56,7 +57,11 @@ struct ChainClock {
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
   }
-  ChainClock(const char *w, size_t l, cudaStream_t s) : what(w), link(l), stream(s), on(TESTENV("CHAIN_TIMES") != nullptr) {
+  ChainClock(const char *w, size_t l, cudaStream_t s) : what(w), link(l), stream(s), on(true) { // one-off (not upstream): forced on; normally TESTENV("CHAIN_TIMES") != nullptr, but
+    // cp_prove's reduced_env_start.h re-exec strips TESTENV's underlying environment variable
+    // before main() runs, so the runtime switch can never fire; hardcoding `on` is a source-level
+    // (not environment-level) way to use this existing instrumentation without touching that
+    // anti-LD_PRELOAD mechanism.
     if (on) began = now();
   }
   ~ChainClock() {
@@ -98,7 +103,16 @@ static inline blk::E chain_element(const T &x) {
   return e;
 }
 // n elements from GPU memory.
+// Diagnostic counters (one-off, not upstream): how often this blocking fetch path is used and how
+// much data it moves, to check whether it is the loop-of-small-syncs anti-pattern suspected from
+// the stage_clock breakdown (door_chain.cuh's close_by_frame calls this once per term/pair).
+static unsigned long long g_chain_fetch_calls = 0, g_chain_fetch_elements = 0;
+// Set once from args.batch_fetch (inputs.cuh) right after parse(): true runs the batched variant
+// (chain_fetch_queue/_sync_all/_take below), false runs the original one-sync-per-call chain_fetch,
+// unchanged. Both live in the same binary so -batch-fetch toggles between them at the command line.
+static bool g_batch_fetch_mode = false;
 static inline std::vector<blk::E> chain_fetch(const T *on_card, size_t n, cudaStream_t stream) {
+  g_chain_fetch_calls++, g_chain_fetch_elements += n;
   std::vector<T> got(n);
   if (n) CK(cudaMemcpyAsync(got.data(), on_card, n * sizeof(T), cudaMemcpyDeviceToHost, stream));
   CK(cudaStreamSynchronize(stream));
@@ -106,6 +120,28 @@ static inline std::vector<blk::E> chain_fetch(const T *on_card, size_t n, cudaSt
   for (size_t i = 0; i < n; i++) out[i] = chain_element(got[i]);
   return out;
 }
+// Batched variant: chain_fetch_queue() issues the async copy only (no sync) and returns a handle;
+// call chain_fetch_sync_all() once after every read of a closing step has been queued; then
+// chain_fetch_take() converts each handle's data, in any order, any number of times. Buffers stay
+// owned by g_pending_got (never erased mid-step, so earlier handles stay valid) until
+// chain_fetch_batch_reset(), called once per close_by_frame() after its reads are all taken.
+static std::vector<std::vector<T>> g_pending_got;
+static inline size_t chain_fetch_queue(const T *on_card, size_t n, cudaStream_t stream) {
+  g_chain_fetch_calls++, g_chain_fetch_elements += n;
+  g_pending_got.emplace_back(n);
+  if (n) CK(cudaMemcpyAsync(g_pending_got.back().data(), on_card, n * sizeof(T), cudaMemcpyDeviceToHost, stream));
+  return g_pending_got.size() - 1;
+}
+static inline void chain_fetch_sync_all(cudaStream_t stream) {
+  if (!g_pending_got.empty()) CK(cudaStreamSynchronize(stream));
+}
+static inline std::vector<blk::E> chain_fetch_take(size_t idx) {
+  const std::vector<T> &got = g_pending_got[idx];
+  std::vector<blk::E> out(got.size());
+  for (size_t i = 0; i < got.size(); i++) out[i] = chain_element(got[i]);
+  return out;
+}
+static inline void chain_fetch_batch_reset() { g_pending_got.clear(); }
 
 class ChainRun {
 public:
@@ -229,6 +265,11 @@ public:
   // not lent.
   void close(blk::ReqEquation equation) {
     take_back();
+    // One-off (not upstream): close() is shared by every sub-proof's closing (layer, attention,
+    // head), but this mark is only meaningful for the layer sub-proof's (stage_clock.h's eqcol_*
+    // buckets); guarded so it doesn't relabel the attention/head stages' own time.
+    const bool localize_here = stage_clock.current() == StageClock::EqColBuild;
+    if (localize_here) stage_clock.at(StageClock::EqColRow);
     // Every scalar that the sub-proof sent must have a mask entry of its own. Three checks:
     // (1) here: the segment's stretches sent as many scalars as the sub-proof drew mask entries,
     // and the equation has as many coefficients on mask entries; (2) the scalars are in one
@@ -277,6 +318,7 @@ public:
       row.target = blk::row_value(*context_, row);
     }
     context_->st.add_row(frame_->group(), std::move(row));
+    if (localize_here) stage_clock.at(StageClock::EqColClose);
     {
       const ChainClock clock("close", link, stream_);
       frame_->close(evaluate);

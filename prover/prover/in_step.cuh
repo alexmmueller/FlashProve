@@ -240,6 +240,8 @@ inline void Prover::wave_has_ended() {
            waves_ended, epoch(), (total - free_bytes) / 1e9, total / 1e9, w.seconds, w.long_ones, w.asks);
     // Time by stage (prover/prover/stage_clock.h); the numbers include the wait for weights.
     SERVING_OR(, if (!closed_front.say_closed("measure: pass %d stages%s; of these the stream stood still for weights %.3f\n", waves_ended, stage_clock.pass_has_ended().c_str(), w.seconds)) stop(End::WriteFailed));
+    // Diagnostic (one-off, not upstream): how many blocking chain_fetch() round-trips this pass made.
+    SERVING_OR(, printf("measure: chain_fetch calls %llu elements %llu\n", g_chain_fetch_calls, g_chain_fetch_elements));
   }
   // With -overlap, the_rider_folds() decodes weights into the slab between turns. Only the restore
   // before the next turn keeps them from its request, so it must reach as far. Neither number is

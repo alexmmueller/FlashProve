@@ -17,6 +17,7 @@
 // Identifiers say "fork" for a sub-proof.
 #pragma once
 #include "common/blas.h"
+#include "engine/fold.cuh"  // one-off (not upstream): g_parallel_fold
 #include "prover/prover.h"
 #include "prover/slot_pads_second.cuh"
 #include <dirent.h>
@@ -65,6 +66,10 @@ inline int Prover::read_inputs() {
     fork_memory.late_begin();
   };
   if (!args.parse(argc, argv)) return 1;
+  g_batch_fetch_mode = args.batch_fetch; // chain_run.cuh: toggles close_by_frame's fetch strategy
+  g_parallel_fold = args.parallel_fold;  // engine/fold.cuh: toggles CardFold::bind()'s threading
+  g_parallel_streams = args.parallel_streams; // chain_frame.cuh/chain_host.cuh: per-slot CUDA streams
+  g_double_buffer_planes = args.double_buffer_planes; // engine/tiled.cuh: CardTiled's planes_ buffer
   if (int rc = read_isk()) return rc;
   if (!name_what_shows()) return 1; // the first lines of output
   // Exit handlers run in the reverse order of their registration, so the CUDA runtime must register

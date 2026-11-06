@@ -28,28 +28,89 @@ namespace hd {
 static ChainHost *the_chain = nullptr;
 static bool the_chain_puts_vectors = false; // set by link_frame() alone
 
+// Batched closing (one-off, not upstream; toggled by -batch-fetch -> g_batch_fetch_mode,
+// chain_run.cuh): defers the several small device->host reads one closing step needs to a single
+// cudaStreamSynchronize() in chain_apply_eq_patches() below, instead of chain_fetch's one sync per
+// read. Each function writes a correctly-shaped placeholder into its return value immediately (so
+// every caller's control flow, including code that appends more entries afterward, runs unchanged)
+// and records what to overwrite once chain_fetch_sync_all() has run. term_index is the index this
+// term will get in eq.terms: valid because, at every call site below, nothing else pushes into
+// eq.terms between this call and the eq.terms.push_back(t) that follows it in the same loop
+// iteration of close_by_frame() (checked by reading that loop).
+struct PendingEqPatch {
+  enum Kind { Equality, SetBits, Written } kind;
+  size_t term_index = 0, fetch_idx = 0, c0 = 0, c1 = 0, n = 0;
+};
+static std::vector<PendingEqPatch> g_pending_eq_patches;
+
 // eq(point, .) as a product form. Coordinate 0 of the point belongs to the top bit of the index;
 // blk::IndexWeights counts bits from the lowest.
-static inline blk::IndexWeights chain_equality(const T *point_on_card, int bits) {
-  std::vector<blk::E> point = chain_fetch(point_on_card, (size_t)bits, cudaStreamPerThread);
-  std::reverse(point.begin(), point.end());
-  return blk::IndexWeights::eq(point);
+static inline blk::IndexWeights chain_equality(const T *point_on_card, int bits, size_t term_index = 0) {
+  if (!g_batch_fetch_mode) {
+    std::vector<blk::E> point = chain_fetch(point_on_card, (size_t)bits, cudaStreamPerThread);
+    std::reverse(point.begin(), point.end());
+    return blk::IndexWeights::eq(point);
+  }
+  const size_t idx = chain_fetch_queue(point_on_card, (size_t)bits, cudaStreamPerThread);
+  g_pending_eq_patches.push_back({PendingEqPatch::Equality, term_index, idx});
+  blk::IndexWeights w;
+  w.lo.assign((size_t)bits, blk::E::one()), w.hi.assign((size_t)bits, blk::E::one()); // placeholder
+  return w;
 }
 // The product form in which a set bit of the index has the factor point[j] and a clear bit the
 // factor 1. Element 0 belongs to the top bit.
-static inline blk::IndexWeights chain_set_bits(const T *point_on_card, int bits) {
+static inline blk::IndexWeights chain_set_bits(const T *point_on_card, int bits, size_t term_index = 0) {
+  if (!g_batch_fetch_mode) {
+    blk::IndexWeights w;
+    w.hi = chain_fetch(point_on_card, (size_t)bits, cudaStreamPerThread);
+    std::reverse(w.hi.begin(), w.hi.end());
+    w.lo.assign(w.hi.size(), blk::E::one());
+    return w;
+  }
+  const size_t idx = chain_fetch_queue(point_on_card, (size_t)bits, cudaStreamPerThread);
+  g_pending_eq_patches.push_back({PendingEqPatch::SetBits, term_index, idx});
   blk::IndexWeights w;
-  w.hi = chain_fetch(point_on_card, (size_t)bits, cudaStreamPerThread);
-  std::reverse(w.hi.begin(), w.hi.end());
-  w.lo.assign(w.hi.size(), blk::E::one());
+  w.hi.assign((size_t)bits, blk::E::one()), w.lo.assign((size_t)bits, blk::E::one()); // placeholder
   return w;
 }
 // A written-out vector on the host: n entries from the GPU, with 0 outside [c0, c1).
-static inline blk::IndexWeights chain_written(const T *on_card, size_t n, size_t c0, size_t c1) {
-  auto v = std::make_shared<std::vector<blk::E>>(chain_fetch(on_card, n, cudaStreamPerThread));
-  for (size_t c = 0; c < n; c++)
-    if (c < c0 || c >= c1) (*v)[c] = blk::E::zero();
+static inline blk::IndexWeights chain_written(const T *on_card, size_t n, size_t c0, size_t c1, size_t term_index = 0) {
+  if (!g_batch_fetch_mode) {
+    auto v = std::make_shared<std::vector<blk::E>>(chain_fetch(on_card, n, cudaStreamPerThread));
+    for (size_t c = 0; c < n; c++)
+      if (c < c0 || c >= c1) (*v)[c] = blk::E::zero();
+    return blk::IndexWeights::written(v);
+  }
+  const size_t idx = chain_fetch_queue(on_card, n, cudaStreamPerThread);
+  g_pending_eq_patches.push_back({PendingEqPatch::Written, term_index, idx, c0, c1, n});
+  auto v = std::make_shared<std::vector<blk::E>>(n, blk::E::zero()); // placeholder, right size
   return blk::IndexWeights::written(v);
+}
+// Applies every patch recorded since the last chain_fetch_batch_reset(), using data that
+// chain_fetch_sync_all() (called by the caller just before this) has made ready.
+static inline void chain_apply_eq_patches(blk::ReqEquation &eq) {
+  for (const PendingEqPatch &p : g_pending_eq_patches) {
+    if (p.kind == PendingEqPatch::Written) {
+      std::vector<blk::E> v = chain_fetch_take(p.fetch_idx);
+      for (size_t c = 0; c < p.n; c++)
+        if (c < p.c0 || c >= p.c1) v[c] = blk::E::zero();
+      eq.terms[p.term_index].on_columns.values = std::make_shared<const std::vector<blk::E>>(std::move(v));
+    } else {
+      std::vector<blk::E> point = chain_fetch_take(p.fetch_idx);
+      std::reverse(point.begin(), point.end());
+      blk::IndexWeights &w = eq.terms[p.term_index].on_rows;
+      // Overwrites only the first point.size() entries: chain_equality's caller (chain_rows_of,
+      // the EQUALITY branch) can append more real (non-fetched) entries after the placeholder,
+      // which must survive untouched; for SetBits nothing is ever appended, and point.size()
+      // covers the whole vector.
+      for (size_t t = 0; t < point.size(); t++) {
+        if (p.kind == PendingEqPatch::Equality) w.lo[t] = blk::E::one() - point[t];
+        else w.lo[t] = blk::E::one();
+        w.hi[t] = point[t];
+      }
+    }
+  }
+  g_pending_eq_patches.clear();
 }
 // The same on the GPU, one thread for each entry: the launch must cover n, which is not checked.
 __global__ static void k_door_factor(T *to, const T *from, size_t n, size_t c0, size_t c1) {
@@ -57,12 +118,12 @@ __global__ static void k_door_factor(T *to, const T *from, size_t n, size_t c0, 
   if (c < n) to[c] = c >= c0 && c < c1 ? from[c] : T{};
 }
 // Sets w to a pair's weights on the R rows of its array, from Pair::form. Returns false for PLAIN.
-static inline bool chain_rows_of(const Pair &p, size_t R, blk::IndexWeights &w) {
+static inline bool chain_rows_of(const Pair &p, size_t R, blk::IndexWeights &w, size_t term_index) {
   const unsigned row_bits = blk::ceil_log2(R);
   if (p.form == EQUALITY) {
     BLK_REQUIRE(p.bits >= 0 && (unsigned)p.bits <= row_bits && (p.first >> p.bits << p.bits) == p.first && p.first < (size_t(1) << row_bits),
                 "door: an equality vector's block is not aligned or lies beyond the array's rows");
-    w = chain_equality(p.point, p.bits);
+    w = chain_equality(p.point, p.bits, term_index);
     for (unsigned t = (unsigned)p.bits; t < row_bits; t++) {  // the bits above pick the block
       const bool one = (p.first >> t) & 1;
       w.lo.push_back(one ? blk::E::zero() : blk::E::one()), w.hi.push_back(one ? blk::E::one() : blk::E::zero());
@@ -76,7 +137,7 @@ static inline bool chain_rows_of(const Pair &p, size_t R, blk::IndexWeights &w) 
   }
   if (p.form == SET_BITS) {
     BLK_REQUIRE(p.bits >= 0 && (unsigned)p.bits == row_bits, "door: a product over the set bits has not one factor for each bit of the row's number");
-    w = chain_set_bits(p.point, p.bits);
+    w = chain_set_bits(p.point, p.bits, term_index);
     return true;
   }
   return false;
@@ -153,7 +214,7 @@ static int close_by_frame(const Door &D, Tr *tr, const char *who, int g) {
     const bool still_kept = t.born + C.fixed.shape.link[t.born].messages[array->message].life > (size_t)D.link;
     for (const Pair &p : x.v) {
       if (!factors || still_kept || !x.K) {
-        t.on_columns = chain_written(p.L, x.K, p.c0, p.c1);
+        t.on_columns = chain_written(p.L, x.K, p.c0, p.c1, eq.terms.size());
         host_elements += x.K;
       } else {
         k_door_factor<<<(unsigned)((x.K + 255) / 256), 256, 0, cudaStreamPerThread>>>(factors + held_elements, p.L, x.K, p.c0, p.c1);
@@ -162,12 +223,12 @@ static int close_by_frame(const Door &D, Tr *tr, const char *who, int g) {
         held_elements += x.K;
       }
       if (x.kind == SYMBOLS) {
-        t.scale = blk::E::one(), t.on_rows = chain_set_bits(x.point, x.nb);
+        t.scale = blk::E::one(), t.on_rows = chain_set_bits(x.point, x.nb, eq.terms.size());
         eq.terms.push_back(t);
       } else if (x.kind == ELEMENTS) {
         t.scale = blk::E::one(), t.on_rows = blk::IndexWeights::eq({});
         eq.terms.push_back(t);
-      } else if (chain_rows_of(p, x.R, t.on_rows)) {
+      } else if (chain_rows_of(p, x.R, t.on_rows, eq.terms.size())) {
         t.scale = blk::E::one();
         if (TESTENV("CHAIN_CHECK_FORMS")) {
           const std::vector<blk::E> cv = chain_fetch(p.cv, x.R, cudaStreamPerThread);
@@ -224,7 +285,15 @@ static int close_by_frame(const Door &D, Tr *tr, const char *who, int g) {
       }
     }
   }
-  eq.on_masks = chain_fetch(D.LS0, D.ns, cudaStreamPerThread);
+  if (g_batch_fetch_mode) {
+    const size_t ls0_idx = chain_fetch_queue(D.LS0, D.ns, cudaStreamPerThread);
+    chain_fetch_sync_all(cudaStreamPerThread); // the one sync for every read this closing step queued
+    chain_apply_eq_patches(eq);
+    eq.on_masks = chain_fetch_take(ls0_idx);
+    chain_fetch_batch_reset();
+  } else {
+    eq.on_masks = chain_fetch(D.LS0, D.ns, cudaStreamPerThread);
+  }
   C.request->close(std::move(eq));
   return 0;
 }

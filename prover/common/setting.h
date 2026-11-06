@@ -243,5 +243,18 @@ static_assert((unsigned long long)((4 * (1ll << ELBZ) - 2) * (1 + (1ll << ERAD) 
 static_assert(ETAU >= 32 && ETAU % 32 == 0, "ETAU must be a multiple of 32: support and sign bits are kept in whole words");
 static_assert(((ETAU & (ETAU - 1)) & ((ETAU & (ETAU - 1)) - 1)) == 0,
               "ETAU must be a power of two or the sum of two: the digits' rows lie in one or two pieces of a lookup's keys");
+// One-off (not upstream): toggles per-request CUDA streams for a batch pass (chain_frame.cuh,
+// chain_host.cuh), set from args.parallel_streams via -parallel-streams. See chain_host.cuh.
+static bool g_parallel_streams = false;
+// One-off (not upstream): double-buffers CardTiled's planes_ work space (engine/tiled.cuh) so
+// span()'s plane-writing kernel for span N+1 can run concurrently with multiply()'s kernel for
+// span N, on a second internal stream, instead of serializing every span through one buffer. Set
+// from args.double_buffer_planes via -double-buffer-planes.
+static bool g_double_buffer_planes = false;
 static_assert(ETAU <= 256 && ETAUF <= 256, "ETAU and ETAUF must be at most 256: a column's coefficients are read from "
                                            "the first 256 bits of two hash outputs");
+// One-off (not upstream): toggles CardFold::bind()'s threaded path (prover/engine/fold.cuh), set
+// from args.parallel_fold (prover/prover/inputs.cuh) via -parallel-fold. Declared here, a header
+// included from nearly everywhere unconditionally, so every translation unit that compiles
+// cp_prove.cu's sources sees the same declaration regardless of include order elsewhere.
+static bool g_parallel_fold = false;

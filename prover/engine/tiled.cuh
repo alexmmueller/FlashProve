@@ -53,6 +53,7 @@
 #include "engine/encode.cuh" // Cell, cell_at
 #include "engine/pooled.cuh"
 #include "engine/products.cuh" // ProductRow, ProductWay, product_bytes, product_spacing, product_offset
+#include "common/setting.h" // one-off (not upstream): g_double_buffer_planes
 #include "field/field.h"
 #include "field/field_lazy.cuh"
 
@@ -318,6 +319,18 @@ public:
   // uploads: on the same stream (Uploads::send() checks that).
   CardTiled(const std::vector<ProductRow> &rows, ProductWay way, cudaStream_t stream, Uploads &uploads) : n_rows_((u32)rows.size()), way_(way), stream_(stream) {
     const OnStream on(stream);
+    // One-off (not upstream): see planes_/planes_b_ below. Self-contained: no caller (fold.cuh)
+    // needs to change, since span()/multiply() are still called in the same order as upstream;
+    // only the buffer and stream that span()'s write kernel lands on changes.
+    if (g_double_buffer_planes) {
+      dbl_ = true;
+      ENGINE_CK(cudaStreamCreateWithFlags(&plane_stream_, cudaStreamNonBlocking));
+      for (int i = 0; i < 2; i++) ENGINE_CK(cudaEventCreateWithFlags(&plane_ready_[i], cudaEventDisableTiming));
+      for (int i = 0; i < 2; i++) ENGINE_CK(cudaEventCreateWithFlags(&slot_consumed_[i], cudaEventDisableTiming));
+      // slot_consumed_ guards a slot's first write too: record it already signaled (no real
+      // consumer to wait for) so span()'s first two calls do not block on a stale, unrecorded event.
+      for (int i = 0; i < 2; i++) ENGINE_CK(cudaEventRecord(slot_consumed_[i], stream));
+    }
     BLK_REQUIRE(rows.size() <= 65535, "tiled products: more than 65,535 rows");
     uploads.send(rows_, rows.data(), rows.size());
     for (const ProductRow &r : rows) ones_ = ones_ || product_offset(r.cell) != 0;
@@ -340,6 +353,16 @@ public:
     uploads.send(where_, where.data(), where.size());
     uploads.send(begin_, begin.data(), begin.size());
     uploads.send(planes_in_, planes_in.data(), planes_in.size());
+  }
+  // One-off (not upstream): the stream and events of g_double_buffer_planes, if used, are owned
+  // here and released here; nothing else in this class allocates raw CUDA resources beyond what
+  // Pooled<T> already manages on its own.
+  ~CardTiled() {
+    if (plane_stream_) ENGINE_CK(cudaStreamDestroy(plane_stream_));
+    for (cudaEvent_t &e : plane_ready_)
+      if (e) ENGINE_CK(cudaEventDestroy(e));
+    for (cudaEvent_t &e : slot_consumed_)
+      if (e) ENGINE_CK(cudaEventDestroy(e));
   }
   // If true, span(), bytes_of() and the multiplications wait for the stream and add their seconds
   // below, for reports.
@@ -364,6 +387,15 @@ public:
     planes_.resize(plane_rows() * width);
     BLK_REQUIRE((std::uintptr_t)planes_.get() % 16 == 0, "tiled products: a work space that does not begin at a multiple of 16");
     if (ones_) ENGINE_CK(cudaMemset2DAsync(planes_.get(), (size_t)TILED_M * width, 1, width, m_tiles_, stream_));
+    // One-off (not upstream): a second, same-sized buffer so span() for the next span can write
+    // while multiply() for the current span still reads the other one (see span()/multiply()).
+    if (dbl_) {
+      const OnStream on_plane(plane_stream_); // one-off (not upstream): planes_b_'s pool allocation
+      // is attributed to the stream it is actually written/read on, not stream_ (see release_work()).
+      planes_b_.resize(plane_rows() * width);
+      BLK_REQUIRE((std::uintptr_t)planes_b_.get() % 16 == 0, "tiled products: a work space that does not begin at a multiple of 16");
+      if (ones_) ENGINE_CK(cudaMemset2DAsync(planes_b_.get(), (size_t)TILED_M * width, 1, width, m_tiles_, plane_stream_));
+    }
     static const bool set = [] {
       ENGINE_CK_ATTRIBUTE(k_tiled_multiply, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TILED_ROOM);
       return true;
@@ -377,8 +409,24 @@ public:
     if (!planes_.size()) return;
     const u64 width = (u64)1 << log_span_;
     const double t0 = now();
-    k_tiled_planes<<<dim3(blocks_for(width / 4, TILED_THREADS), n_rows_), TILED_THREADS, 0, stream_>>>(planes_.get(), width, rows_.get(), where_.get(), from, width);
-    ENGINE_CK(cudaGetLastError());
+    if (!dbl_) {
+      k_tiled_planes<<<dim3(blocks_for(width / 4, TILED_THREADS), n_rows_), TILED_THREADS, 0, stream_>>>(planes_.get(), width, rows_.get(), where_.get(), from, width);
+      ENGINE_CK(cudaGetLastError());
+    } else {
+      // One-off (not upstream): double-buffered span(). Alternates which of planes_/planes_b_ this
+      // call writes, on plane_stream_ rather than stream_, so the GPU can run it alongside the
+      // previous span's still-running multiply() kernel on stream_ instead of after it. Before
+      // reusing a slot, waits (on plane_stream_, not the host) for that slot's last reader
+      // (multiply(), via slot_consumed_) to be done; after writing, lets stream_ know the slot it
+      // is about to read is ready, without the host blocking on either stream.
+      cur_slot_ ^= 1;
+      signed char *dst = cur_slot_ ? planes_b_.get() : planes_.get();
+      ENGINE_CK(cudaStreamWaitEvent(plane_stream_, slot_consumed_[cur_slot_], 0));
+      k_tiled_planes<<<dim3(blocks_for(width / 4, TILED_THREADS), n_rows_), TILED_THREADS, 0, plane_stream_>>>(dst, width, rows_.get(), where_.get(), from, width);
+      ENGINE_CK(cudaGetLastError());
+      ENGINE_CK(cudaEventRecord(plane_ready_[cur_slot_], plane_stream_));
+      ENGINE_CK(cudaStreamWaitEvent(stream_, plane_ready_[cur_slot_], 0));
+    }
     seconds_row_bytes += now() - t0;
   }
   // Writes vectors' signed bytes. sources: `count` descriptors on the GPU; longest: the largest of
@@ -401,9 +449,13 @@ public:
     BLK_REQUIRE(turned_ && !released_ && planes_.size(), "tiled products: a multiplication before the first span, or after the work space was given back");
     BLK_REQUIRE(count * m_tiles_ < ((u64)1 << 31), "tiled products: more blocks than a launch takes");
     const double t0 = now();
-    k_tiled_multiply<<<(unsigned)(count * m_tiles_), TILED_THREADS, TILED_ROOM, stream_>>>(out, planes_.get(), (u64)1 << log_span_, m_tiles_, ones_, log_slab, work, tiles, columns,
+    const signed char *src = dbl_ ? (cur_slot_ ? planes_b_.get() : planes_.get()) : planes_.get();
+    k_tiled_multiply<<<(unsigned)(count * m_tiles_), TILED_THREADS, TILED_ROOM, stream_>>>(out, src, (u64)1 << log_span_, m_tiles_, ones_, log_slab, work, tiles, columns,
                                                                                          where_.get(), begin_.get(), planes_in_.get());
     ENGINE_CK(cudaGetLastError());
+    // One-off (not upstream): lets span()'s NEXT use of this same slot (two spans from now) go
+    // ahead once this read is done, instead of waiting for the host.
+    if (dbl_) ENGINE_CK(cudaEventRecord(slot_consumed_[cur_slot_], stream_));
     seconds_multiply += now() - t0;
   }
   // All chunks of one tile by the field's arithmetic, under either ProductWay. tile: on the host;
@@ -419,7 +471,14 @@ public:
   }
 
   // Gives back the work space. After it span() and multiply() fail; rows_on_card() stays valid.
-  void release_work() { planes_.release(), released_ = true; }
+  void release_work() {
+    // One-off (not upstream): plane_stream_'s work must be visibly done before planes_b_ (whose
+    // pool allocation is attributed to plane_stream_, see open()) is freed, since nothing else
+    // drains plane_stream_ on its own; a full host-side wait here is fine (release_work() already
+    // runs at request end, not in the per-span hot path).
+    if (dbl_) ENGINE_CK(cudaStreamSynchronize(plane_stream_));
+    planes_.release(), planes_b_.release(), released_ = true;
+  }
 
   // The time in seconds, after a wait for the stream; 0 if `trace` is false.
   double now() const {
@@ -441,6 +500,17 @@ private:
   Pooled<TiledRow> where_;
   Pooled<u32> begin_, planes_in_;
   Pooled<signed char> planes_;
+  // One-off (not upstream): g_double_buffer_planes's state. planes_b_ is the second buffer;
+  // cur_slot_ (0: planes_, 1: planes_b_) is which one the last span() call wrote and multiply()
+  // must therefore read; plane_stream_ is where span()'s write kernel runs when doubled, instead
+  // of stream_; plane_ready_[s]/slot_consumed_[s] cross-stream-synchronize slot s's write and read
+  // without any host-side wait. All no-ops (dbl_ stays false) unless -double-buffer-planes is set.
+  bool dbl_ = false;
+  int cur_slot_ = 0;
+  cudaStream_t plane_stream_ = nullptr;
+  cudaEvent_t plane_ready_[2] = {nullptr, nullptr};
+  cudaEvent_t slot_consumed_[2] = {nullptr, nullptr};
+  Pooled<signed char> planes_b_;
 };
 
 } // namespace blk

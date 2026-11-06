@@ -72,6 +72,16 @@ struct ChainHost {
   ChainShape fixed;            // made once, by links_from() and settle()
   // One run per request of a batch pass, created at set-up. enter(j) points `request` at run j.
   std::vector<std::unique_ptr<ChainRun>> in_step;
+  // One-off (not upstream): one CUDA stream per in_step slot, used only if g_parallel_streams
+  // (common/setting.h) is set; else every slot's stream is cudaStreamPerThread, as upstream. The
+  // requests of a batch pass are cryptographically independent of one another (separate
+  // Fiat-Shamir transcripts, separate nonces), so nothing about correctness requires funneling
+  // their GPU work through one stream; GPU memory used by Pooled<T> (prover/engine/pooled.cuh)
+  // comes from CUDA's stream-ordered pool allocator, which is built to be shared safely by
+  // several streams (card_arena(), the one case that is not, is never engaged by this binary:
+  // InArena is not instantiated anywhere outside arena.h in this repository).
+  std::vector<cudaStream_t> streams;
+  cudaStream_t stream_of(int member) const { return streams.empty() ? cudaStreamPerThread : streams[member]; }
   ChainRun *request = nullptr;
   int member = 0; // the index in `in_step` of the run that `enter` selected
   void enter(int member_) { member = member_, request = in_step[member_].get(); }

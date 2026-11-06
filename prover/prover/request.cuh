@@ -195,9 +195,11 @@ inline int Prover::prove_layer_group(int g) {
   if (int rc = g_stack(g)) return rc;
   if (int rc = g_gated_products(g)) return rc;
   if (int rc = g_row_passes(g)) return rc;
-  stage_clock.at(StageClock::Closing);
+  stage_clock.at(StageClock::Fold);
   if (int rc = g_fold(g)) return rc;
+  stage_clock.at(StageClock::Walk);
   if (int rc = g_walk(g)) return rc;
+  stage_clock.at(StageClock::EqColBuild);
   if (int rc = g_equations_and_columns(g)) return rc;
   fork_memory.run_end();
   return prove_attention_fork(g); // -measure's stages forward and attention
@@ -246,7 +248,9 @@ inline void Prover::finish_request(Slot &s) {
   fork_memory.check_what_is_lent(false);
   chain.request->take_back();
   chain.request->finish();
+  stage_clock.at(StageClock::EndSeal);
   chain_member_and_seal(s); // fills s.part.lin_first and s.part.seal
+  stage_clock.at(StageClock::EndAfter);
   chain.request->channel().finish_inside_a_file(); // the file goes on with other chains' bytes
   // [own-test-engine-coins] Checks a sample of the private random values before bytes go to disk.
   coins_hold(s.coins.get(), "a request's");

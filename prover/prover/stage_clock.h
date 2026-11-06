@@ -49,7 +49,11 @@
 //              work on an earlier batch's opening (its test on the weight table) between two turns
 //              (a turn is one request's work on one layer group or on the output head)
 struct StageClock {
-  enum Stage { Start, Forward, Commit, Tables, Sums, Rows, Closing, Attention, Head, Frame, End, Turns, STAGES };
+  // Split for a one-off diagnostic (not upstream): Closing -> Fold/Walk/EqCol, Frame ->
+  // FrameFirst/FrameLater, End -> End/EndSeal/EndAfter, to localize the cost within each bucket.
+  // EqCol itself split further into EqColBuild (close_by_frame's term loop + batch patches),
+  // EqColRow and EqColClose (ChainRun::close()'s own "row" and "close" sub-steps).
+  enum Stage { Start, Forward, Commit, Tables, Sums, Rows, Fold, Walk, EqColBuild, EqColRow, EqColClose, Attention, Head, FrameFirst, FrameLater, End, EndSeal, EndAfter, Turns, STAGES };
 #ifdef SERVING_BUILD
   void at(Stage) {}
   struct Within {
@@ -67,6 +71,11 @@ struct StageClock {
     marks.push_back({s, now()});
     stage = s;
   }
+  // One-off (not upstream): lets a caller elsewhere in the file (ChainRun::close(), shared by
+  // every sub-proof's closing, not just the layer sub-proof's) check the current stage before
+  // switching, so a mark meant only for one caller's window doesn't mislabel another's (e.g. the
+  // attention or head sub-proof's own closing, which reuses the same close() function).
+  Stage current() const { return stage; }
   // Switches to stage s until the end of the enclosing block, then back to the stage before.
   struct Within {
     StageClock &clock;
@@ -85,7 +94,7 @@ struct StageClock {
   // variable unchanged; no test covers a failing one. If a call fails, the line reports it and
   // gives only the host's numbers.
   std::string pass_has_ended() {
-    static const char *const NAMES[STAGES] = {"start", "forward", "commit", "tables", "sums", "rows", "closing", "attention", "head", "frame", "end", "turns"};
+    static const char *const NAMES[STAGES] = {"start", "forward", "commit", "tables", "sums", "rows", "fold", "walk", "eqcol_build", "eqcol_row", "eqcol_close", "attention", "head", "frame_first", "frame_later", "end", "end_seal", "end_after", "turns"};
     double stream[STAGES] = {0}, host[STAGES] = {0};
     bool all_came = true;
     for (size_t i = 0; i + 1 < marks.size(); i++) {

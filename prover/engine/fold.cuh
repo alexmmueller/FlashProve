@@ -27,11 +27,13 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "code/code.h"
+#include "common/setting.h"  // one-off (not upstream): g_parallel_fold
 #include "engine/device.cuh"
 #include "engine/pooled.cuh"
 #include "engine/encode.cuh" // Cell, cell_at
@@ -819,6 +821,8 @@ struct FoldSetting {
 
 // Use: the constructor makes G; then k times round() and bind(); then end(). The constructor and
 // end() return after the stream's work is done.
+// g_parallel_fold (common/setting.h): one-off (not upstream), set from args.parallel_fold
+// (inputs.cuh) via -parallel-fold. See bind() below for why.
 class CardFold {
 public:
   // A row of c with at least this many product forms over F on all places has them summed
@@ -880,6 +884,9 @@ public:
     products_ = std::make_unique<CardTiled>(rows, setting_.way, stream_, uploads);
     products_->grid_rows = setting_.grid_rows;
     products_->trace = setting_.trace;
+#ifndef BLK_FOLD_PRINT
+#define BLK_FOLD_PRINT // one-off (not upstream): enable the fold's own built-in timing printf
+#endif
 #ifdef BLK_FOLD_PRINT // a build switch: prints where each fold's time goes, from the members below
     const auto t_begin = std::chrono::steady_clock::now();
 #endif
@@ -920,14 +927,47 @@ public:
   }
 
   // Binds the lowest row variable that is left to gamma.
+  // One-off (not upstream): these two loops over (a, b) are independent across a (each output
+  // entry reads only gram_/half, never another a's output), and measurement (stage_clock.h's
+  // eqcol_close bucket: its "stream" and "host" times come out equal, meaning no GPU work is
+  // queued while this runs) showed this plain host loop, not a GPU kernel, is what "the closing"
+  // actually spends its time on for a small fold (CardFold is capped at 2^10 rows). g_parallel_fold
+  // (-parallel-fold) splits both loops' outer index across std::thread workers; off by default, so
+  // the original sequential code below is unchanged unless asked for.
   void bind(const E &gamma) {
     BLK_REQUIRE(left_ >= 1, "fold: no row variable is left");
     const size_t n = (size_t)1 << left_, h = n / 2;
     std::vector<E> half(n * h), next(h * h);
-    for (size_t a = 0; a < n; a++)
-      for (size_t b = 0; b < h; b++) half[a * h + b] = fold_pair(gram_[a * n + 2 * b], gram_[a * n + 2 * b + 1], gamma);
-    for (size_t a = 0; a < h; a++)
-      for (size_t b = 0; b < h; b++) next[a * h + b] = fold_pair(half[2 * a * h + b], half[(2 * a + 1) * h + b], gamma);
+    if (g_parallel_fold && n >= 64) {
+      // Capped low, not hardware_concurrency(): CardFold is at most 2^10 rows by design (this
+      // file's header comment), so bind()'s work per call tops out around n/2 * n/2 fold_pair
+      // calls (<= ~262k for n=1024) -- too little work to amortize OS thread-creation cost across
+      // more than a handful of threads, confirmed by measurement (128 threads measured slower
+      // than the unthreaded baseline on a 128-vCPU host).
+      const unsigned T = std::max(1u, std::min(8u, (unsigned)n));
+      auto split = [&](size_t total, auto body) {
+        std::vector<std::thread> pool;
+        const size_t chunk = (total + T - 1) / T;
+        for (unsigned t = 0; t < T; t++) {
+          const size_t a0 = t * chunk, a1 = std::min(total, a0 + chunk);
+          if (a0 < a1) pool.emplace_back(body, a0, a1);
+        }
+        for (std::thread &th : pool) th.join();
+      };
+      split(n, [&](size_t a0, size_t a1) {
+        for (size_t a = a0; a < a1; a++)
+          for (size_t b = 0; b < h; b++) half[a * h + b] = fold_pair(gram_[a * n + 2 * b], gram_[a * n + 2 * b + 1], gamma);
+      });
+      split(h, [&](size_t a0, size_t a1) {
+        for (size_t a = a0; a < a1; a++)
+          for (size_t b = 0; b < h; b++) next[a * h + b] = fold_pair(half[2 * a * h + b], half[(2 * a + 1) * h + b], gamma);
+      });
+    } else {
+      for (size_t a = 0; a < n; a++)
+        for (size_t b = 0; b < h; b++) half[a * h + b] = fold_pair(gram_[a * n + 2 * b], gram_[a * n + 2 * b + 1], gamma);
+      for (size_t a = 0; a < h; a++)
+        for (size_t b = 0; b < h; b++) next[a * h + b] = fold_pair(half[2 * a * h + b], half[(2 * a + 1) * h + b], gamma);
+    }
     gram_.swap(next);
     gamma_.push_back(gamma);
     left_--;
